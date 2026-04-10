@@ -4,7 +4,7 @@
 ====================================================
 Lance ce script sur ton Mac :
     pip install flask qrcode pillow
-    python server.py
+    python qr_code.py
 
 Pepper affiche automatiquement le QR code au démarrage.
 Scanne le QR code → envoie une radio → Pepper annonce le résultat.
@@ -12,6 +12,7 @@ Scanne le QR code → envoie une radio → Pepper annonce le résultat.
 Mac, téléphone et Pepper doivent être sur le même réseau WiFi.
 ====================================================
 """
+import time
 
 from flask import Flask, request, jsonify, render_template_string
 import torch
@@ -27,7 +28,7 @@ import qi
 
 app = Flask(__name__)
 
-ROBOT_IP   = "192.168.13.222"
+ROBOT_IP   = "192.168.13.202"
 ROBOT_PORT = 9559
 MODEL_PATH = "model_full.pt"
 
@@ -69,7 +70,7 @@ transform = transforms.Compose([
 # ─────────────────────────────────────────────
 pepper_tts     = None
 pepper_tablet  = None
-pepper_session = None  # garder la session en vie
+pepper_session = None
 
 def connect_pepper():
     global pepper_tts, pepper_tablet, pepper_session
@@ -143,7 +144,12 @@ def show_qr_on_tablet(url):
 def show_result_on_tablet(label, confidence):
     if pepper_tablet is None:
         return
-    color = "#ef4444" if label == "PNEUMONIE" else "#22c55e"
+    if label == "PNEUMONIE":
+        color = "#ef4444"
+    elif label == "COVID":
+        color = "#f97316"
+    else:
+        color = "#22c55e"
     html  = f"""
     <html><head><meta charset="UTF-8">
     <style>
@@ -173,40 +179,7 @@ def show_result_on_tablet(label, confidence):
 # 4. Validation + Prédiction
 # ─────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# Prétraitement de l'image
-# ─────────────────────────────────────────────
-def preprocess_xray(pil_image):
-    """
-    Convertit une photo de radio prise par telephone pour qu'elle
-    ressemble a une radio numerique :
-    1. Niveaux de gris
-    2. Egalisation d'histogramme pour le contraste
-    3. Normalisation de la luminosite
-    4. Reconversion en RGB (attendu par le modele)
-    """
-    from PIL import ImageOps, ImageFilter
 
-    # 1. Niveaux de gris
-    gray = pil_image.convert("L")
-
-    # 2. Egalisation globale d'histogramme
-    equalized = ImageOps.equalize(gray)
-    arr_eq    = np.array(equalized, dtype=np.float32)
-
-    # 3. Normalisation : etirer les valeurs entre 0 et 255
-    arr_min, arr_max = arr_eq.min(), arr_eq.max()
-    if arr_max > arr_min:
-        arr_norm = (arr_eq - arr_min) / (arr_max - arr_min) * 255
-    else:
-        arr_norm = arr_eq
-
-    # 4. Legerement ameliorer la nettete
-    result = Image.fromarray(arr_norm.astype(np.uint8), mode="L")
-    result = result.filter(ImageFilter.SHARPEN)
-
-    # 5. Reconvertir en RGB pour le modele
-    return result.convert("RGB")
 
 
 def is_valid_image(pil_image):
@@ -231,10 +204,12 @@ def predict(pil_image):
         probs = torch.softmax(model(img_tensor), dim=1).squeeze().tolist()
     idx   = probs.index(max(probs))
     label = class_names[idx]
-    if label in ("COVID", "PNEUMONIA", "PNEUMONIE"):
+    if label in ("PNEUMONIA", "PNEUMONIE"):
         result     = "PNEUMONIE"
-        confidence = sum(probs[i] for i, c in enumerate(class_names)
-                         if c in ("COVID", "PNEUMONIA", "PNEUMONIE"))
+        confidence = probs[class_names.index("PNEUMONIA")]
+    elif label in ("COVID", "COVID-19"):
+        result = "COVID"
+        confidence = probs[class_names.index("COVID")]
     else:
         result     = "NORMAL"
         confidence = probs[class_names.index("NORMAL")]
@@ -306,6 +281,7 @@ HTML_PAGE = """
     /* Résultat */
     .result-box { width:100%; padding:20px; border-radius:12px; text-align:center; display:none; }
     .pneumonie  { background:#450a0a; border:2px solid #ef4444; }
+    .covid      { background:#431407; border:2px solid #f97316; }
     .normal     { background:#052e16; border:2px solid #22c55e; }
     .result-label { font-size: 40px; font-weight: bold; margin-bottom: 6px; }
     .result-conf  { font-size: 15px; color: #94a3b8; }
@@ -325,7 +301,6 @@ HTML_PAGE = """
       <span>📁</span>
       <span>Glissez une image ici</span>
       <div class="btn-row" style="margin-top:10px;">
-        <button class="btn-secondary" style="font-size:13px; padding:10px;" onclick="document.getElementById('fileCamera').click()">📷 Prendre une photo</button>
         <button class="btn-secondary" style="font-size:13px; padding:10px;" onclick="document.getElementById('fileStorage').click()">🖼 Choisir une image</button>
       </div>
       <input type="file" id="fileCamera"  accept="image/*" capture="environment">
@@ -358,7 +333,6 @@ HTML_PAGE = """
         <span>📁</span>
         <span>Glissez une image ici</span>
         <div class="btn-row" style="margin-top:10px;">
-          <button class="btn-secondary" style="font-size:13px; padding:10px;" onclick="document.getElementById('fileCamera').click()">📷 Prendre une photo</button>
           <button class="btn-secondary" style="font-size:13px; padding:10px;" onclick="document.getElementById('fileStorage').click()">🖼 Choisir une image</button>
         </div>
         <input type="file" id="fileCamera"  accept="image/*" capture="environment">
@@ -427,7 +401,7 @@ HTML_PAGE = """
         const conf  = (data.confidence * 100).toFixed(1);
         document.getElementById("resultLabel").textContent = label;
         document.getElementById("resultConf").textContent  = "Confiance : " + conf + "%";
-        resultBox.className     = "result-box " + (label === "PNEUMONIE" ? "pneumonie" : "normal");
+        resultBox.className     = "result-box " + (label === "PNEUMONIE" ? "pneumonie" : label === "COVID" ? "covid" : "normal");
         resultBox.style.display = "block";
         document.getElementById("analyzeBtn").disabled = false;
 
@@ -470,9 +444,6 @@ def predict_route():
     except Exception:
         return jsonify({"error": "Impossible de lire l'image."}), 400
 
-    # Prétraitement
-    pil_image = preprocess_xray(pil_image)
-
     valid, reason = is_valid_image(pil_image)
     if not valid:
         if pepper_tts:
@@ -486,9 +457,14 @@ def predict_route():
         if pepper_tts:
             if label == "PNEUMONIE":
                 pepper_tts.say(f"Attention, détection de pneumonie. Confiance de {confidence*100:.0f} pourcents.")
+            elif label == "COVID":
+                pepper_tts.say(f"Attention, détection possible de COVID. Confiance de {confidence*100:.0f} pourcents.")
             else:
                 pepper_tts.say(f"Résultat normal, aucune anomalie détectée. Confiance de {confidence*100:.0f} pourcents.")
         show_result_on_tablet(label, confidence)
+        pepper_tts.say(f"Attention, je suis un robot d'assistance et je ne remplace pas l'avis d'un spécialiste")
+        time.sleep(7)
+        show_qr_on_tablet(url)
     except Exception as e:
         print(f"Pepper non disponible : {e}")
 
