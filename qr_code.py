@@ -31,11 +31,46 @@ app = Flask(__name__)
 ROBOT_IP   = "192.168.13.202"
 ROBOT_PORT = 9559
 MODEL_PATH = "model_full.pt"
+FILTER_MODEL_PATH = "filter_model.pt"
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+filter_checkpoint = torch.load(FILTER_MODEL_PATH, map_location=device)
+
+filter_model = models.efficientnet_b0(weights=None)
+in_features = filter_model.classifier[1].in_features
+filter_model.classifier = nn.Sequential(
+    nn.Dropout(0.3),
+    nn.Linear(in_features, 2)
+)
+
+filter_model.load_state_dict(filter_checkpoint["model_state_dict"])
+filter_model.to(device)
+filter_model.eval()
+
+filter_class_names = filter_checkpoint["class_names"]
+
+print("Filtre chargé :", filter_class_names)
 
 # ─────────────────────────────────────────────
 # 1. Chargement du modèle
 # ─────────────────────────────────────────────
-device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+def is_chest_xray(pil_image):
+    img_tensor = transform(pil_image).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        probs = torch.softmax(filter_model(img_tensor), dim=1).squeeze()
+
+    idx = probs.argmax().item()
+    confidence = probs[idx].item()
+    label = filter_class_names[idx]
+
+    print(f"[FILTRE] {label} ({confidence*100:.1f}%)")
+
+    if label != "RADIO" or confidence < 0.8:
+        return False, f"Image non reconnue comme une radio ({confidence*100:.1f}%)"
+
+    return True, ""
 
 checkpoint  = torch.load(MODEL_PATH, map_location=device)
 model_name  = checkpoint["model_name"]
@@ -448,6 +483,14 @@ def predict_route():
     if not valid:
         if pepper_tts:
             pepper_tts.say(f"Image invalide. {reason}")
+        return jsonify({"error": reason}), 400
+
+    # 2. 🔥 FILTRE RADIO (NOUVEAU)
+    is_radio, reason = is_chest_xray(pil_image)
+    if not is_radio:
+        print("❌ Rejet :", reason)
+        if pepper_tts:
+            pepper_tts.say("L'image envoyée ne semble pas être une radio pulmonaire.")
         return jsonify({"error": reason}), 400
 
     label, confidence = predict(pil_image)
